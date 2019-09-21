@@ -1203,6 +1203,7 @@ enum Message {
 ///
 /// Each unit of work corresponds to a directory that should be descended
 /// into.
+#[derive(Debug)]
 struct Work {
     /// The directory entry.
     dent: DirEntry,
@@ -1325,16 +1326,6 @@ impl Worker {
                     return;
                 }
             }
-            let readdir = match work.read_dir() {
-                Ok(readdir) => readdir,
-                Err(err) => {
-                    if (self.f)(Err(err)).is_quit() {
-                        self.quit_now();
-                        return;
-                    }
-                    continue;
-                }
-            };
             let descend = if let Some(root_device) = work.root_device {
                 match is_same_file_system(root_device, work.dent.path()) {
                     Ok(true) => true,
@@ -1350,9 +1341,8 @@ impl Worker {
             } else {
                 true
             };
-
-            let depth = work.dent.depth();
-            match (self.f)(Ok(work.dent)) {
+            
+            match (self.f)(Ok(work.dent.clone())) {
                 WalkState::Continue => {}
                 WalkState::Skip => continue,
                 WalkState::Quit => {
@@ -1363,9 +1353,22 @@ impl Worker {
             if !descend {
                 continue;
             }
+            let depth = work.dent.depth();
             if self.max_depth.map_or(false, |max| depth >= max) {
                 continue;
             }
+            
+            let readdir = match work.read_dir() {
+                Ok(readdir) => readdir,
+                Err(err) => {
+                    if (self.f)(Err(err)).is_quit() {
+                        self.quit_now();
+                        return;
+                    }
+                    continue;
+                }
+            };
+
             for result in readdir {
                 let state = self.run_one(&work.ignore, depth + 1, work.root_device, result);
                 if state.is_quit() {
@@ -1767,33 +1770,44 @@ mod tests {
         paths
     }
 
-    fn walk_collect_parallel(prefix: &Path, builder: &WalkBuilder) -> Vec<String> {
+    fn walk_collect_parallel(prefix: &Path, builder: &WalkBuilder) -> Result<Vec<String>,()> {
         let mut paths = vec![];
-        for dent in walk_collect_entries_parallel(builder) {
+        for result in walk_collect_entries_parallel(builder) {
+            let dent = match result {
+                Ok(dent) => dent,
+                Err(_) => return Err(())
+            };
             let path = dent.path().strip_prefix(prefix).unwrap();
             if path.as_os_str().is_empty() {
                 continue;
             }
             paths.push(normal_path(path.to_str().unwrap()));
+             
         }
         paths.sort();
-        paths
+        Ok(paths)
     }
 
-    fn walk_collect_entries_parallel(builder: &WalkBuilder) -> Vec<DirEntry> {
+    fn walk_collect_entries_parallel(builder: &WalkBuilder) -> Vec<Result<DirEntry,super::Error>> {
         let dents = Arc::new(Mutex::new(vec![]));
         builder.build_parallel().run(|| {
             let dents = dents.clone();
             Box::new(move |result| {
-                if let Ok(dent) = result {
-                    dents.lock().unwrap().push(dent);
-                }
+                dents.lock().unwrap().push(result);
                 WalkState::Continue
             })
         });
 
+        
         let dents = dents.lock().unwrap();
-        dents.to_vec()
+        dents.iter().map(|x|x.clone()).collect()
+            /*filter_map(|result| 
+            match result {
+                Ok(dent) => Some(dent.clone()),
+                _ => None
+            }).collect();
+        let errors = vec![];
+        (dirs, errors)*/
     }
 
     fn mkpaths(paths: &[&str]) -> Vec<String> {
@@ -1809,8 +1823,12 @@ mod tests {
     fn assert_paths(prefix: &Path, builder: &WalkBuilder, expected: &[&str]) {
         let got = walk_collect(prefix, builder);
         assert_eq!(got, mkpaths(expected), "single threaded");
-        let got = walk_collect_parallel(prefix, builder);
-        assert_eq!(got, mkpaths(expected), "parallel");
+        if let Ok(got) = walk_collect_parallel(prefix, builder) {
+            assert_eq!(got, mkpaths(expected), "parallel");
+        }
+        else {
+            panic!("Parallel exit with error");
+        }
     }
 
     #[test]
@@ -2023,7 +2041,8 @@ mod tests {
 
         let dents = walk_collect_entries_parallel(&WalkBuilder::new(td.path().join("foo")));
         assert_eq!(1, dents.len());
-        assert!(!dents[0].path_is_symlink());
+        let element = dents[0].as_ref().unwrap();
+        assert!(!element.path_is_symlink());
     }
 
     #[cfg(unix)] // because symlinks on windows are weird
@@ -2070,5 +2089,25 @@ mod tests {
         let mut builder = WalkBuilder::new(td.path());
         builder.follow_links(true).same_file_system(true);
         assert_paths(td.path(), &builder, &["same_file", "same_file/alink"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_read_permissions() {
+        let dir_path = Path::new("/etc/sudoers.d");
+
+        // There's no /etc/sudoers.d, skip the test.
+        if !dir_path.is_dir() {
+            return;
+        }
+
+        // We're the root, so the test won't check what we want it to.
+        if fs::read_dir(&dir_path).is_ok() {
+            return;
+        }
+
+        let mut builder = WalkBuilder::new(&dir_path);
+        builder.max_depth(Some(0));
+        assert_paths(dir_path.parent().unwrap(), &builder, &["sudoers.d"]);
     }
 }
